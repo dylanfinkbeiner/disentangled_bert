@@ -1,3 +1,3 @@
 # Forked from jiant
 
-[original repo](https://github.com/nyu-mll/jiant) 
+A project built on top of the [jiant toolkit](https://github.com/nyu-mll/jiant).
