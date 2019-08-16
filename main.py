@@ -36,7 +36,10 @@ from jiant.utils.utils import (
     sort_param_recursive,
     select_relevant_print_args,
     check_for_previous_checkpoints,
+    write_records_dict,
+    get_records_dict,
 )
+import pickle
 
 
 # Global notification handler, can be accessed outside main() during exception handling.
@@ -254,6 +257,7 @@ def get_best_checkpoint_path(args, phase, task_name=None):
         else:
             checkpoint = glob.glob(os.path.join(args.run_dir, "model_state_pretrain_val_*.best.th"))
     if phase == "eval":
+        # In other words, if we should load_eval_checkpoint
         if args.load_eval_checkpoint not in ("none", ""):
             checkpoint = glob.glob(args.load_eval_checkpoint)
             assert len(checkpoint) > 0, (
@@ -265,6 +269,7 @@ def get_best_checkpoint_path(args, phase, task_name=None):
             checkpoint = glob.glob(
                 os.path.join(args.run_dir, task_name, "model_state_target_train_val_*.best.th")
             )
+            # NOTE This is where we are generally going, since load_eval_checkpoint has been "none" and len(checkpoint) would be 0
             if len(checkpoint) == 0:
                 checkpoint = glob.glob(
                     os.path.join(args.run_dir, "model_state_pretrain_val_*.best.th")
@@ -276,7 +281,7 @@ def get_best_checkpoint_path(args, phase, task_name=None):
     return None
 
 
-def evaluate_and_write(args, model, tasks, splits_to_write):
+def evaluate_and_write(args, model, tasks, splits_to_write, mode=None, do_write=False):
     """ Evaluate a model on dev and/or test, then write predictions """
     val_results, val_preds = evaluate.evaluate(model, tasks, args.batch_size, args.cuda, "val")
     if "val" in splits_to_write:
@@ -289,10 +294,19 @@ def evaluate_and_write(args, model, tasks, splits_to_write):
             tasks, te_preds, args.run_dir, "test", strict_glue_format=args.write_strict_glue_format
         )
 
-    run_name = args.get("run_name", os.path.basename(args.run_dir))
-    results_tsv = os.path.join(args.exp_dir, "results.tsv")
-    log.info("Writing results for split 'val' to %s", results_tsv)
-    evaluate.write_results(val_results, results_tsv, run_name=run_name)
+    # val_results will be all_metrics; all_metrics has keys like "taskname_metricname : metricvalue"
+
+    if args.records_pickle_path:
+        evaluate.pickle_results(
+            val_results,
+            path=args.records_pickle_path,
+            mode=mode)
+
+    if do_write:
+        run_name = args.get("run_name", os.path.basename(args.run_dir))
+        results_tsv = os.path.join(args.exp_dir, "results.tsv")
+        log.info("Writing results for split 'val' to %s", results_tsv)
+        evaluate.write_results(val_results, results_tsv, run_name=run_name)
 
 
 def initial_setup(args, cl_args):
@@ -364,6 +378,8 @@ def initial_setup(args, cl_args):
                 "Falling back to CPU."
             )
             args.cuda = -1
+
+    args.records_pickle_path = os.path.join(args.run_dir, f'records_{args.run_name}.pkl') if args.pickle_records else None
 
     return args, seed
 
@@ -463,13 +479,38 @@ def main(cl_arguments):
     # Check for deprecated arg names
     check_arg_name(args)
     args, seed = initial_setup(args, cl_args)
+
+    #XXX Dylan's code
+    try:
+        log.info(f'\nK syn is {args.k_syn}')
+        log.info(f'\nK sem is {args.k_sem}\n')
+    except Exception:
+        log.info('No projection matrices.')
+        pass
+    #XXX
+
     # Load tasks
     log.info("Loading tasks...")
     start_time = time.time()
     pretrain_tasks, target_tasks, vocab, word_embs = build_tasks(args)
+    #pretrain_tasks[0].load_data()
+    #exit()
     tasks = sorted(set(pretrain_tasks + target_tasks), key=lambda x: x.name)
     log.info("\tFinished loading tasks in %.3fs", time.time() - start_time)
     log.info("\t Tasks: {}".format([task.name for task in tasks]))
+
+
+    training_flag = args.do_pretrain 
+    if training_flag and args.records_pickle_path:
+        with open(args.records_pickle_path, 'wb') as f:
+            records_dict = dict()
+            records_dict['run_name'] = args.run_name
+            records_dict['last_checkpoint'] = ''
+            records_dict['training'] = dict()
+            records_dict['best_val'] = dict()
+            records_dict['last_val'] = dict()
+            pickle.dump(records_dict, f)
+
 
     # Build model
     log.info("Building model...")
@@ -479,7 +520,7 @@ def main(cl_arguments):
 
     # Start Tensorboard if requested
     if cl_args.tensorboard:
-        tb_logdir = os.path.join(args.run_dir, "tensorboard")
+        tb_logdir = os.path.join(args.run_dir, "tensorboard_" + str(args.run_name))
         _run_background_tensorboard(tb_logdir, cl_args.tensorboard_port)
 
     check_configurations(args, pretrain_tasks, target_tasks)
@@ -505,6 +546,7 @@ def main(cl_arguments):
             schd_params,
             args.load_model,
             phase="pretrain",
+            args=args
         )
 
     # For checkpointing logic
@@ -556,18 +598,45 @@ def main(cl_arguments):
                 phase="target_train",
             )
 
+    tasks_for_eval = [task for task in target_tasks if (not 'adv' in task.name and not 'discriminator' in task.name)]
+
     if args.do_full_eval:
         log.info("Evaluating...")
         splits_to_write = evaluate.parse_write_preds_arg(args.write_preds)
 
         # Evaluate on target_tasks.
-        for task in target_tasks:
+        #for task in target_tasks:
+        for task in tasks_for_eval:
             # Find the task-specific best checkpoint to evaluate on.
             task_to_use = model._get_task_params(task.name).get("use_classifier", task.name)
             ckpt_path = get_best_checkpoint_path(args, "eval", task_to_use)
             assert ckpt_path is not None
             load_model_state(model, ckpt_path, args.cuda, skip_task_models=[], strict=strict)
-            evaluate_and_write(args, model, [task], splits_to_write)
+            records_dict = get_records_dict(args.records_pickle_path) if args.evaluate_final else None
+            evaluate_and_write(
+                    args, 
+                    model, 
+                    [task], 
+                    splits_to_write, 
+                    mode='best_val', 
+                    do_write=(not args.evaluate_final) or (records_dict != None and ckpt_path == records_dict['last_checkpoint'])
+                    )
+
+                
+        if args.evaluate_final:
+            records_dict = get_records_dict(args.records_pickle_path)
+            if ckpt_path != records_dict['last_checkpoint']:
+                try:
+                    load_model_state(model, records_dict['last_checkpoint'], args.cuda, skip_task_models=[], strict=strict)
+                    for task in tasks_for_eval:
+                        evaluate_and_write(args, model, [task], splits_to_write, mode='last_val', do_write=True)
+
+                except Exception:
+                    log.info(f"Did not record last_checkpoint path properly. Looks like: {records_dict['last_checkpoint']}")
+            else:
+                records_dict['last_val'] = records_dict['best_val']
+                write_records_dict(records_dict, args.records_pickle_path)
+
 
     log.info("Done!")
 

@@ -9,6 +9,7 @@ import json
 import numpy as np
 import pandas as pd
 from allennlp.data import vocabulary
+import logging as log
 
 from jiant.utils.tokenizers import get_tokenizer
 from jiant.utils.retokenize import realign_spans
@@ -67,6 +68,7 @@ def load_pair_nli_jsonl(data_file, tokenizer_name, max_seq_len, targ_map):
     data = [json.loads(d) for d in open(data_file, encoding="utf-8")]
     sent1s, sent2s, trgs, idxs, pair_ids = [], [], [], [], []
     for example in data:
+        log.info('We in here boys!')
         sent1s.append(process_sentence(tokenizer_name, example["premise"], max_seq_len))
         sent2s.append(process_sentence(tokenizer_name, example["hypothesis"], max_seq_len))
         trg = targ_map[example["label"]] if "label" in example else 0

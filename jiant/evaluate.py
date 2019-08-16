@@ -23,6 +23,11 @@ from jiant.tasks.tasks import (
 )
 from jiant.tasks.qa import MultiRCTask, ReCoRDTask
 from jiant.tasks.edge_probing import EdgeProbingTask
+import pickle
+from jiant.utils.utils import (
+    write_records_dict,
+    get_records_dict,
+)
 
 
 LOG_INTERVAL = 30
@@ -637,3 +642,15 @@ def write_results(results, results_file, run_name):
     with open(results_file, "a") as results_fh:
         results_fh.write("%s\t%s\n" % (run_name, all_metrics_str))
     log.info(all_metrics_str)
+
+
+def pickle_results(results, path=None, mode=None):
+    all_metrics_str = ", ".join(["%s: %.3f" % (metric, score) for metric, score in results.items()])
+    records_dict = get_records_dict(path)
+    val_dict = records_dict[mode]
+
+    for metric, score in results.items():
+        val_dict[metric] = score
+
+    write_records_dict(records_dict, path)
+    

@@ -22,6 +22,7 @@ from allennlp.training.optimizers import Optimizer  # pylint: disable=import-err
 from tensorboardX import SummaryWriter  # pylint: disable=import-error
 from torch.nn.utils.clip_grad import clip_grad_norm_
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+import pickle
 
 from jiant.evaluate import evaluate
 from jiant.utils import config
@@ -29,6 +30,8 @@ from jiant.utils.utils import (
     assert_for_log,
     find_last_checkpoint_epoch,
     check_for_previous_checkpoints,
+    get_records_dict,
+    write_records_dict
 )  # pylint: disable=import-error
 
 
@@ -150,6 +153,7 @@ def build_trainer(
             "max_epochs": params["max_epochs"],
             "dec_val_scale": params["dec_val_scale"],
             "training_data_fraction": params["training_data_fraction"],
+            "run_name": args.run_name
         }
     )
     assert (
@@ -178,6 +182,7 @@ class SamplingMultiTaskTrainer:
         max_epochs=-1,
         dec_val_scale=100,
         training_data_fraction=1.0,
+        run_name=None,
     ):
         """
         The training coordinator. Unusually complicated to handle MTL with tasks of
@@ -242,7 +247,7 @@ class SamplingMultiTaskTrainer:
 
         self._TB_dir = None
         if self._serialization_dir is not None:
-            self._TB_dir = os.path.join(self._serialization_dir, "tensorboard")
+            self._TB_dir = os.path.join(self._serialization_dir, f"tensorboard_{run_name}")
             self._TB_train_log = SummaryWriter(os.path.join(self._TB_dir, "train"))
             self._TB_validation_log = SummaryWriter(os.path.join(self._TB_dir, "val"))
 
@@ -332,9 +337,12 @@ class SamplingMultiTaskTrainer:
                 # Warning: This won't be precise when training_data_fraction is set, since each
                 #  example is included or excluded independently using a hashing function.
                 # Fortunately, it doesn't need to be.
+                log.info(f'Task {task.name} has pretrain fraction {task.pretrain_fraction}')
                 task_info["n_tr_batches"] = math.ceil(
-                    task.n_train_examples * self._training_data_fraction / batch_size
+                    #task.n_train_examples * self._training_data_fraction / batch_size # Original
+                    task.n_train_examples * task.pretrain_fraction / batch_size #XXX
                 )
+                log.info(f'Task {task.name} will have {math.ceil(task.n_train_examples * task.pretrain_fraction)} many training examples after subsampling.')
             else:
                 task_info["n_tr_batches"] = math.ceil(task.n_train_examples / batch_size)
 
@@ -364,6 +372,7 @@ class SamplingMultiTaskTrainer:
         self.task_to_metric_mapping = {task.val_metric: task.name for task in tasks}
         self._task_infos = task_infos
         self._metric_infos = metric_infos
+
         return task_infos, metric_infos
 
     def get_scaling_weights(self, scaling_method, num_tasks, task_names, task_n_train_examples):
@@ -459,6 +468,7 @@ class SamplingMultiTaskTrainer:
         scheduler_params,
         load_model=1,
         phase="pretrain",
+        args=None,
     ):
         """
         The main training loop.
@@ -481,23 +491,50 @@ class SamplingMultiTaskTrainer:
         ----------
         Validation results
         """
+        self._records_pickle_path = args.records_pickle_path
+        first_validation = True
+        val_batch_size = args.batch_size
+        #if self._records_pickle_path is not None:
+        #    records_dict = get_records_dict(self._records_pickle_path)
+        #    all_metrics = [("%s_loss" % task.name) for task in tasks]
+        #    for task in tasks:
+        #        task_metrics = task.get_metrics(reset=False)
+        #        for metric in task_metrics.keys():
+        #            all_metrics.append(f'{task.name}_{metric}')
+
+        #    for metric in all_metrics:
+        #        log.info(f'Big juicy metric {metric}')
+        #        records_dict['training'][metric] = list()
+        #    write_records_dict(records_dict, self._records_pickle_path)
+
+        #torch.autograd.set_detect_anomaly(True)
         validation_interval = self._val_interval
         task_infos, metric_infos = self._setup_training(
             tasks, batch_size, train_params, optimizer_params, scheduler_params, phase
         )
 
+        #if 'mnli-adv' in task_infos:
+        #    task_infos['mnli-adv']['n_tr_batches'] = task_infos['cola']['n_tr_batches'] #XXX
+
         optimizer_params = copy.deepcopy(optimizer_params)
         if "t_total" in optimizer_params and self._max_epochs > 0:
+            #n_epoch_steps = sum([info["n_tr_batches"] for name, info in task_infos.items() if 'adv' in name])
             n_epoch_steps = sum([info["n_tr_batches"] for info in task_infos.values()])
             optimizer_params["t_total"] = n_epoch_steps * self._max_epochs
         optimizer = Optimizer.from_params(train_params, optimizer_params)
         scheduler = LearningRateScheduler.from_params(optimizer, copy.deepcopy(scheduler_params))
+
+        if args.use_amp:
+            from apex import amp
+            self._model, optimizer = amp.initialize(self._model, optimizer, opt_level="O1")
+
         self._optimizer = optimizer
         self._scheduler = scheduler
 
         # define these here b/c they might get overridden on load
 
-        n_step, should_stop = 0, False
+        n_step = 0
+        should_stop = False if not args.random_baseline else True
         if self._serialization_dir is not None:
             # Resume from serialization path
             if load_model:
@@ -527,10 +564,23 @@ class SamplingMultiTaskTrainer:
         assert_for_log(len(tasks) > 0, "Error: Expected to sample from 0 tasks.")
 
         task_names = [task.name for task in tasks]
-        task_n_train_examples = np.array([task.n_train_examples for task in tasks])
+
+        # XXX
+        #cola_n_train_examples = 0
+        discriminator_examples = [math.ceil(task.n_train_examples * task.pretrain_fraction) for task in tasks if 'discriminator' in task.name]
+        if discriminator_examples != []:
+            mean_disc_examples = math.ceil(sum(discriminator_examples) / len(discriminator_examples)) 
+        # XXX
+            
+        # Variable task_n_train_examples used only to calculate scaling/sampling weights and nowhere else
+        #task_n_train_examples = [task.n_train_examples for task in tasks] # Original
+        task_n_train_examples = [math.ceil(task.n_train_examples * task.pretrain_fraction) if not 'discriminator' in task.name else mean_disc_examples for task in tasks] #XXX
+
+        task_n_train_examples = np.array(task_n_train_examples)
         task_n_train_batches = np.array([task_infos[task.name]["n_tr_batches"] for task in tasks])
         log.info(
-            "Training examples per task, before any subsampling: "
+            #"Training examples per task, before any subsampling: "
+            "Training examples per task, after any subsampling: "
             + str(dict(zip(task_names, task_n_train_examples)))
         )
         if len(tasks) > 1:
@@ -538,12 +588,7 @@ class SamplingMultiTaskTrainer:
                 weighting_method, len(tasks), task_n_train_examples, task_n_train_batches
             )
 
-            normalized_sample_weights = np.array(sample_weights) / sum(sample_weights)
-            log.info(
-                "Using weighting method: %s, with normalized sample weights %s ",
-                weighting_method,
-                np.array_str(normalized_sample_weights, precision=4),
-            )
+            #normalized_sample_weights = np.array(sample_weights) / sum(sample_weights)
             scaling_weights = self.get_scaling_weights(
                 scaling_method, len(tasks), task_names, task_n_train_examples
             )
@@ -551,18 +596,40 @@ class SamplingMultiTaskTrainer:
             sample_weights = normalized_sample_weights = [1.0]
             scaling_weights = {task_names[0]: 1.0}
 
+
+        for task_name in scaling_weights.keys():
+            if 'adv' in task_name:
+                scaling_weights[task_name] = float(args[f"scale_{(task_name).replace('-', '_')}"])
+
+        normalized_sample_weights = np.array(sample_weights) / sum(sample_weights)
+        log.info(
+            "Using weighting method: %s, with normalized sample weights %s ",
+            weighting_method,
+            np.array_str(normalized_sample_weights, precision=4),
+        )
         # Sample the tasks to train on. Do it all at once (val_interval) for
-        # MAX EFFICIENCY.
-        samples = random.choices(tasks, weights=sample_weights, k=validation_interval)
+        # MAX EFFICIENCY. We resample after a validation step.
+        samples = random.choices(tasks, weights=normalized_sample_weights, k=validation_interval)
+        #-> we get a list of validation_interval-many samples of tasks
+        #--> But if we have a lot of tasks and val_int is relatively small, we might never train a given task, right?
+
+        tasks_dict = { t.name : t for t in tasks }
+        #adversaries = { 'mnli' : tasks_dict['cola-adv'], 'cola' : tasks_dict['mnli-adv'] }
+        #adversaries = { 'mnli' : tasks_dict['cola-adv'], 'cola' : tasks_dict['mnli-adv'] , 'cola-adv' : tasks_dict['mnli'], 'mnli-adv' : tasks_dict['cola']}
+        adv_training = True in [('adv' in t.name) for t in tasks]
 
         offset = 0
         all_tr_metrics = {}
         log.info("Beginning training with stopping criteria based on metric: %s", stop_metric)
+        original_settings = self._get_original_settings(self._model)
+        self._freeze(self._model, train_adv=False) # By default, place model in mostly-unfrozen state
+        optimization_stopped = {task.name : False for task in tasks}
         while not should_stop:
             self._model.train()
-            task = samples[(n_step + offset) % validation_interval]  # randomly select a task
+            task = samples[(n_step + offset) % validation_interval] # randomly select a task
             task_info = task_infos[task.name]
             if task_info["stopped"]:
+                #log.info(f"Task {task.name} has stopped, skipping training loop iteration.")
                 offset += 1
                 continue
             tr_generator = task_info["tr_generator"]
@@ -570,7 +637,30 @@ class SamplingMultiTaskTrainer:
             n_batches_since_val = task_info["n_batches_since_val"]
             tr_loss = task_info["loss"]
 
-            for batch in itertools.islice(tr_generator, 1):
+            adv_task = None
+            if 'adv' in task.name or 'discriminator' in task.name: # Freeze all but adversarial classifiers
+                self._freeze(self._model, train_adv=True)
+            else: # Unfreeze all but adversarial classifiers 
+                self._freeze(self._model, train_adv=False)
+                if adv_training:
+                    #adv_task = adversaries[task.name] #XXX should replace if-else logic below
+                    if task.name == 'cola': # cola and rte-adv share the syntactic proj matrix
+                        adv_task = tasks_dict['mnli-adv']
+                    elif task.name == 'mnli': # rte and cola-adv share the semantic proj matrix
+                        adv_task = tasks_dict['cola-adv']
+                    adv_task_info = task_infos[adv_task.name]
+                    tr_generator_adv = adv_task_info["tr_generator"]
+
+
+            #total_batches_trained = task_info["total_batches_trained"]
+            #n_batches_since_val = task_info["n_batches_since_val"]
+            #adv_tr_loss = adv_task_info["loss"]
+
+            #for batch in itertools.islice(tr_generator, 1):
+            # start of old indent
+            if not optimization_stopped[task.name]:
+                batch = next(tr_generator)
+
                 n_batches_since_val += 1
                 total_batches_trained += 1
                 optimizer.zero_grad()
@@ -578,23 +668,70 @@ class SamplingMultiTaskTrainer:
                 assert_for_log(
                     "loss" in output_dict, "Model must return a dict containing a 'loss' key"
                 )
-                loss = output_dict["loss"]  # optionally scale loss
+                if not 'discriminator' in task.name:
+                    loss = output_dict["loss"]
+                else:
+                    loss = output_dict["loss_shared"]
+                #log.info(f'Loss on {task.name}: {loss.item()}')
+                #loss *= scaling_weights[task.name] # Commented out since all but adversarial tasks have scaling weight 1
 
-                loss *= scaling_weights[task.name]
-
-                loss.backward()
                 assert_for_log(not torch.isnan(loss).any(), "NaNs in loss.")
-                tr_loss += loss.data.cpu().numpy()
+                tr_loss += loss.data.cpu().numpy() #NOTE For Tensorboard, we are documenting loss - advloss
+
+                if adv_task != None:
+                    batch_adv = next(tr_generator_adv)
+                    output_dict_adv = self._forward(batch_adv, task=adv_task)
+                    loss_adv = output_dict_adv["loss"]
+                    loss_adv *= scaling_weights[adv_task.name]
+                    loss -= loss_adv
+
+                    loss_shared = output_dict["loss_shared"]
+                    loss_shared *= float(args.scale_shared)
+                    loss -= loss_shared
+                    loss_orthogonality = output_dict["loss_orthogonality"]
+                    log.info(f'Loss orthogonality: {loss_orthogonality.item()}')
+                    loss_orthogonality *= float(args.scale_orthogonality)
+                    loss += loss_orthogonality
+
+                    #log.info(f'Loss on {task.name} - loss on {adv_task.name}: {loss.item()}')
+                    assert_for_log(not torch.isnan(loss).any(), "NaNs in loss.")
+
+                if args.use_amp:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                        del loss
+                else:
+                    loss.backward()
+
 
                 # Gradient regularization and application
                 if self._grad_norm:
                     clip_grad_norm_(self._model.parameters(), self._grad_norm)
-                optimizer.step()
+
+                #log.info(f'Gradients (after clipping) on {task.name}')
+                #log.info(self._gradient_update(self._model, verbose=True))
+
+                #optimizer.step()
+                ret = optimizer.step() # ret = loss, warn
+                #if (type(ret) != type(None)) and ret[1] >= 0 and num_unfinished == 1:
+                if (type(ret) != type(None)) and ret[1] >= 0:
+                    log.info(f"Hit that point for {task.name}")
+                    optimization_stopped[task.name] = True
+                    #if adv_task != None: 
+                    #   optimization_stopped[adv_task.name] = True # Should stop adversarial model from training PAST its opponent
+                    #NOTE optimization will still stop early for the adversarial task here!
+                    #NOTE we need to fix this at the point of giving t_total to the optimizer!
                 n_step += 1  # update per batch
 
                 # step scheduler if it's not ReduceLROnPlateau
                 if not isinstance(scheduler.lr_scheduler, ReduceLROnPlateau):
                     scheduler.step_batch(n_step)
+            else:
+                log.info(f"Hit max_epochs for task {task.name} and now just making increments.")
+                n_step += 1
+                n_batches_since_val += 1
+                total_batches_trained += 1
+            # end of old indent
 
             # Update training progress on that task
             task_info["n_batches_since_val"] = n_batches_since_val
@@ -608,7 +745,10 @@ class SamplingMultiTaskTrainer:
                 # log to tensorboard
                 if self._TB_dir is not None:
                     task_metrics_to_TB = task_metrics.copy()
-                    task_metrics_to_TB["loss"] = float(task_info["loss"] / n_batches_since_val)
+                    if n_batches_since_val > 0:
+                        task_metrics_to_TB["loss"] = float(task_info["loss"] / n_batches_since_val)
+                    else:
+                        task_metrics_to_TB["loss"] = 0.0
                     self._metrics_to_tensorboard_tr(n_step, task_metrics_to_TB, task.name)
 
                 task_metrics["%s_loss" % task.name] = tr_loss / n_batches_since_val
@@ -641,7 +781,7 @@ class SamplingMultiTaskTrainer:
                         task_metrics = task.get_metrics(reset=True)
                         for name, value in task_metrics.items():
                             all_tr_metrics["%s_%s" % (task.name, name)] = value
-                        # updating loss from trianing.
+                        # updating loss from training.
                         all_tr_metrics["%s_loss" % task.name] = float(
                             task_info["loss"] / n_batches_since_val
                         )
@@ -659,7 +799,8 @@ class SamplingMultiTaskTrainer:
 
                 # Validate
                 log.info("Validating...")
-                all_val_metrics, should_save, new_best = self._validate(n_val, tasks, batch_size)
+                #all_val_metrics, should_save, new_best = self._validate(n_val, tasks, batch_size) # Original
+                all_val_metrics, should_save, new_best = self._validate(n_val, tasks, val_batch_size) # XXX
 
                 # Check stopping conditions
                 should_stop = self._check_stop(n_val, stop_metric, tasks)
@@ -671,8 +812,18 @@ class SamplingMultiTaskTrainer:
                         log_str += " training: %3f" % all_tr_metrics[name]
                     log_str += " validation: %3f" % value
                     log.info(log_str)
+
                 if self._TB_dir is not None:
                     self._metrics_to_tensorboard_val(n_step, all_val_metrics)
+
+                #XXX
+                if first_validation:
+                    self._setup_records_dict(tasks, all_val_metrics)
+                    first_validation = False
+                if self._records_pickle_path is not None:
+                    self._metrics_to_records(all_val_metrics) 
+                #XXX
+
                 log.info(f"Global learning rate: {self._optimizer.param_groups[0]['lr']}")
                 elmo_params = self._model.get_elmo_mixing_weights(tasks)
                 if elmo_params:  # log ELMo mixing weights
@@ -688,13 +839,15 @@ class SamplingMultiTaskTrainer:
                             )
                         )
 
-                # Reset training preogress
+                # Reset training progress
                 all_tr_metrics = {}
                 samples = random.choices(
-                    tasks, weights=sample_weights, k=validation_interval
+                    tasks, weights=normalized_sample_weights, k=validation_interval
                 )  # pylint: disable=no-member
+                #num_unfinished = sum([1 for task_info in task_infos.values() if not task_info["stopped"]])
 
                 if should_save:
+                    self._unfreeze(self._model, original_settings)
                     self._save_checkpoint(
                         {"step": n_step, "validation_pass": n_val, "should_stop": should_stop},
                         tasks=tasks,
@@ -702,8 +855,71 @@ class SamplingMultiTaskTrainer:
                         new_best=new_best,
                     )
 
+
+        if args.random_baseline:
+            self._unfreeze(self._model, original_settings)
+            self._save_checkpoint(
+                    {"step": 0, "validation_pass": 0, "should_stop": True},
+                    tasks=tasks,
+                    phase=phase,
+                    new_best=True,
+                    )
+
         log.info("Stopped training after %d validation checks", n_step / validation_interval)
+        self._unfreeze(self._model, original_settings)
         return self._aggregate_results(tasks, task_infos, metric_infos)  # , validation_interval)
+
+
+    def _freeze(self, model, train_adv=False):
+        for n, p in model.named_parameters():
+            if 'adv' in n: # Discriminator is called "adv_discriminator"
+                p.requires_grad = train_adv
+            else:
+                p.requires_grad = (not train_adv)
+
+
+    def _unfreeze(self, model, original_settings):
+        for n, p in model.named_parameters():
+            if original_settings[n] == True:
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+
+
+    def _get_original_settings(self, model):
+        original_settings = {}
+        for n, p in model.named_parameters():
+            original_settings[n] = p.requires_grad
+
+        return original_settings
+
+
+    def _gradient_update(self, model, verbose=False):
+        update = ''
+        t = 0
+        for p in model.parameters():
+            if type(p.grad) != type(None):
+                n = p.grad.data.norm(2)
+                t += n.item() ** 2
+        t = t ** (1. / 2)
+        if verbose:
+            l = []
+            for n, p in list(model.named_parameters()):
+                if type(p.grad) != type(None):
+                    l.append((n, p.grad.data.norm(2).item()))
+                else:
+                    l.append((n, 0.0))
+            #l = [(n, p.grad.data.norm(2).item() if type(p.grad) != type(None) else n, 0.0) for n, p in list(model.named_parameters())]
+            print(l)
+            update += '\n'.join(['{:35} {:3.8f}'.format(
+                name, norm) for name, norm in l])
+                #(n, p.grad.data.norm(2).item() if type(p.grad) != type(None) else n, 0.0)) for n, p in list(model.named_parameters())])
+            update += f'\nTotal norm of gradient is {t}\n'
+        else: 
+            update += 'Total norm of gradient: {:5.8f}\n'.format(t)
+    
+        return update
+
 
     def _aggregate_results(self, tasks, task_infos, metric_infos):
         """ Helper function to print results after finishing training """
@@ -802,7 +1018,7 @@ class SamplingMultiTaskTrainer:
         -------
         n_examples_overall: int, current number of examples
         task_infos: updated Instance with reset training progress
-        all_val_metrics: dictinary updated with micro and macro average validation performance
+        all_val_metrics: dictionary updated with micro and macro average validation performance
         """
         n_examples, batch_num = 0, 0
         task_info = task_infos[task.name]
@@ -811,18 +1027,23 @@ class SamplingMultiTaskTrainer:
             max_data_points = min(task.n_val_examples, self._val_data_limit)
         else:
             max_data_points = task.n_val_examples
+        #NOTE If we build a new generator for each validation, must see same max_data_points each time
         val_generator = BasicIterator(batch_size, instances_per_epoch=max_data_points)(
             task.val_data, num_epochs=1, shuffle=False
         )
         val_generator = move_to_device(val_generator, self._cuda_device)
         n_val_batches = math.ceil(max_data_points / batch_size)
+        #NOTE Reset validation loss on each validation, so not an average
         all_val_metrics["%s_loss" % task.name] = 0.0
 
         for batch in val_generator:
             batch_num += 1
             with torch.no_grad():
                 out = self._forward(batch, task=task)
-            loss = out["loss"]
+            if not 'discriminator' in task.name:
+                loss = out["loss"]
+            else:
+                loss = out["loss_shared"]
             all_val_metrics["%s_loss" % task.name] += loss.data.cpu().numpy()
             n_examples += out["n_exs"]
 
@@ -852,20 +1073,24 @@ class SamplingMultiTaskTrainer:
             all_val_metrics["micro_avg"] += (
                 1 - all_val_metrics[task.val_metric] / self._dec_val_scale
             ) * n_examples
-            all_val_metrics["macro_avg"] += (
-                1 - all_val_metrics[task.val_metric] / self._dec_val_scale
-            )
+            if not 'adv' in task.name:
+                all_val_metrics["macro_avg"] += (
+                    1 - all_val_metrics[task.val_metric] / self._dec_val_scale
+                ) #XXX
         else:
             # triggers for single-task cases and during MTL when task val metric increases
             all_val_metrics["micro_avg"] += all_val_metrics[task.val_metric] * n_examples
-            all_val_metrics["macro_avg"] += all_val_metrics[task.val_metric]
+            if not 'adv' in task.name:
+                all_val_metrics["macro_avg"] += all_val_metrics[task.val_metric] #XXX
         n_examples_overall += n_examples
 
         # Reset training progress
         task_info["n_batches_since_val"] = 0
-        task_info["loss"] = 0
+        task_info["loss"] = 0 #NOTE this is only ever used for training loss
         all_val_metrics["micro_avg"] /= n_examples_overall
-        all_val_metrics["macro_avg"] /= len(tasks)
+        log.info(f'Macro avg: {all_val_metrics["macro_avg"]} being divided by len(tasks): {len(tasks)}')
+        if not 'adv' in task.name:
+            all_val_metrics["macro_avg"] /= len([task for task in tasks if not 'adv' in task.name]) #XXX we divide by the number of tasks every time??
         return n_examples_overall, task_infos, all_val_metrics
 
     def _validate(self, val_pass, tasks, batch_size, periodic_save=True):
@@ -944,6 +1169,7 @@ class SamplingMultiTaskTrainer:
 
         return all_val_metrics, should_save, new_best
 
+    #def _check_stop(self, val_n, stop_metric, tasks, adversaries=None):
     def _check_stop(self, val_n, stop_metric, tasks):
         """ Check to see if should stop """
         task_infos, metric_infos = self._task_infos, self._metric_infos
@@ -958,7 +1184,22 @@ class SamplingMultiTaskTrainer:
                     # Commented out the below line as more confusing than helpful. May make sense
                     # to restore if we wind up using more complex stopping strategies.
                     # log.info("Reached max_epochs limit for %s.", task.name)
+                    #if adversaries != None:
+                    #   adversary_info = task_infos[ adversaries[task.name].name ]
+                    #   if adversary_info["stopped"]
+
                     task_info["stopped"] = True
+            #if adversaries != None:
+            #    for task in tasks:
+            #        task_info = task_infos[task.name]
+            #        adversary_info = task_infos[ adversaries[task.name].name ]
+            #        # Don't let an adversary tap out
+            #        if 'adv' in task.name and not adversary_info["stopped"]:
+            #            task_info["stopped"] = False
+            #        # Don't let an adversary shadowbox
+            #        else if task_info["stopped"]:
+            #            adversary_info["stopped"] = True
+            #        
             stop_epochs = min([info["stopped"] for info in task_infos.values()])
             if stop_epochs:
                 log.info("Reached max_epochs limit on all tasks. Stopping training.")
@@ -1048,6 +1289,12 @@ class SamplingMultiTaskTrainer:
             task_dir_name,
             "model_state_{}_val_{}{}.th".format(phase, val_pass, best_str),
         )
+
+        if self._records_pickle_path:
+            records_dict = get_records_dict(self._records_pickle_path)
+            records_dict['last_checkpoint'] = model_path
+            write_records_dict(records_dict, self._records_pickle_path)
+
 
         model_state = self._model.state_dict()
 
@@ -1208,6 +1455,34 @@ class SamplingMultiTaskTrainer:
             name = os.path.join(name.split("_")[0], name)
             self._TB_validation_log.add_scalar(name, val_metric, val_pass)
 
+
+    def _setup_records_dict(self, tasks, val_metrics):
+        records_dict = get_records_dict(self._records_pickle_path)
+        all_metrics = [("%s_loss" % task.name) for task in tasks]
+        
+        for metric in val_metrics.keys():
+            if metric == "micro_avg" or metric == "macro_avg":
+                continue
+            all_metrics.append(metric)
+
+        for metric in all_metrics:
+            records_dict['training'][metric] = list()
+        write_records_dict(records_dict, self._records_pickle_path)
+
+
+    def _metrics_to_records(self, val_metrics):
+        pickle_path = self._records_pickle_path
+        records_dict = get_records_dict(pickle_path)
+
+        metric_names = val_metrics.keys()
+        for name in metric_names:
+            if name == "micro_avg" or name == "macro_avg":
+                continue
+            val_metric = val_metrics.get(name)
+            records_dict['training'][name].append(val_metric)
+
+        write_records_dict(records_dict, pickle_path)
+
     @classmethod
     def from_params(cls, model, serialization_dir, params):
         """ Generate trainer from parameters.  """
@@ -1225,6 +1500,7 @@ class SamplingMultiTaskTrainer:
         max_epochs = params.pop("max_epochs", -1)
         dec_val_scale = params.pop("dec_val_scale", 100)
         training_data_fraction = params.pop("training_data_fraction", 1.0)
+        run_name = params.pop("run_name")
 
         params.assert_empty(cls.__name__)
         return SamplingMultiTaskTrainer(
@@ -1243,4 +1519,5 @@ class SamplingMultiTaskTrainer:
             max_epochs=max_epochs,
             dec_val_scale=dec_val_scale,
             training_data_fraction=training_data_fraction,
+            run_name = run_name
         )

@@ -6,6 +6,8 @@ import _pickle as pkl
 import base64
 from zlib import crc32
 
+import logging as log
+
 
 def _serialize(examples, fd, flush_every):
     for i, example in enumerate(examples):
@@ -73,14 +75,20 @@ def read_records(filename, repeatable=False, fraction=None):
     """
 
     def _iter_fn():
+        #log.info(f'Starting over with _iter_fn')
         with open(filename, "rb") as fd:
+            counter = 0
+            total_lines = 0
             for line in fd:
+                total_lines += 1
                 blob = base64.b64decode(line)
                 if fraction and fraction < 1:
                     hash_float = bytes_to_float(blob)
                     if hash_float > fraction:
                         continue
                 example = pkl.loads(blob)
+                counter += 1
                 yield example
-
+        log.info(f'Count: {counter}, Total: {total_lines}, Proportion is: {counter/total_lines}')
     return RepeatableIterator(_iter_fn) if repeatable else _iter_fn()
+

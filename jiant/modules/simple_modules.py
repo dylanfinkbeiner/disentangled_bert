@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 
+import logging as log
+
 
 class NullPhraseLayer(nn.Module):
     """ Dummy phrase layer that does nothing. Exists solely for API compatibility. """

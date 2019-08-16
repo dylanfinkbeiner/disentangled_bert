@@ -186,6 +186,8 @@ def build_sent_encoder(args, vocab, d_emb, tasks, embedder, cove_layer):
             cove_layer=cove_layer,
         )
         d_sent = 2 * args.d_hid
+
+        #XXX THIS ONE FOR BERT
     elif args.sent_enc == "none":
         # Expose word representation layer (GloVe, ELMo, etc.) directly.
         assert_for_log(args.skip_embs, f"skip_embs must be set for " "'{args.sent_enc}' encoder")
@@ -201,7 +203,7 @@ def build_sent_encoder(args, vocab, d_emb, tasks, embedder, cove_layer):
             cove_layer=cove_layer,
         )
         d_sent = 0  # skip connection added below
-        log.info("No shared encoder (just using word embeddings)!")
+        log.info("No shared encoder (just using [contextualized] word embeddings)!")
     else:
         assert_for_log(False, "No valid sentence encoder specified.")
     return sent_encoder, d_sent
@@ -245,12 +247,15 @@ def build_model(args, vocab, pretrained_embs, tasks):
         d_emb, embedder, cove_layer = build_embeddings(args, vocab, tasks, pretrained_embs)
     d_sent_input = args.d_hid
 
+    # d_sent_output is 0 for BERT
     sent_encoder, d_sent_output = build_sent_encoder(
         args, vocab, d_emb, tasks, embedder, cove_layer
     )
+
     # d_task_input is the input dimension of the task-specific module
     # set skip_emb = 1 if you want to concatenate the encoder input with encoder output to pass
     # into task specific module.
+    #XXX skip_embs NEEDS to be 1 for BERT to work as it ought to
     d_task_input = d_sent_output + (args.skip_embs * d_emb)
 
     # Build model and classifiers
@@ -482,13 +487,29 @@ def build_task_specific_modules(task, model, d_sent, d_emb, vocab, embedder, arg
     """ Build task-specific components for a task and add them to model.
         These include decoders, linear layers for linear models.
      """
+    #XXX We need to get the input size right for the final classification layers
+    if args.special_task:
+        if task.subspace == 'syn':
+            #d_sent = args.k_syn
+            if not 'adv' in task.name:
+                d_sent = args.k_syn + args.k_shared
+            else:
+                d_sent = args.k_syn
+        if task.subspace == 'sem':
+            #d_sent = args.k_sem
+            if not 'adv' in task.name:
+                d_sent = args.k_sem + args.k_shared
+            else:
+                d_sent = args.k_sem
+    #XXX
+
     task_params = model._get_task_params(task.name)
-    if isinstance(task, SingleClassificationTask):
+    if isinstance(task, SingleClassificationTask): # CoLA, for example
         module = build_single_sentence_module(
             task=task, d_inp=d_sent, use_bert=model.use_bert, params=task_params
         )
         setattr(model, "%s_mdl" % task.name, module)
-    elif isinstance(task, (PairClassificationTask, PairRegressionTask, PairOrdinalRegressionTask)):
+    elif isinstance(task, (PairClassificationTask, PairRegressionTask, PairOrdinalRegressionTask)): # MNLI, for example
         module = build_pair_sentence_module(task, d_sent, model=model, params=task_params)
         setattr(model, "%s_mdl" % task.name, module)
     elif isinstance(task, LanguageModelingParsingTask):
@@ -585,10 +606,14 @@ def build_single_sentence_module(task, d_inp: int, use_bert: bool, params: Param
             (optional) a linear projection, pooling, and an MLP classifier
     """
     pooler = Pooler(
-        project=not use_bert, d_inp=d_inp, d_proj=params["d_proj"], pool_type=params["pool_type"]
+        project=not use_bert, 
+        d_inp=d_inp, 
+        d_proj=params["d_proj"], 
+        pool_type=params["pool_type"]
     )
     d_out = d_inp if use_bert else params["d_proj"]
     classifier = Classifier.from_params(d_out, task.n_classes, params)
+    log.info(f'Task {task.name} has a classifier with d_out {d_out}')
     module = SingleClassifier(pooler, classifier)
     return module
 
@@ -645,6 +670,7 @@ def build_pair_sentence_module(task, d_inp, model, params):
         # sequence, so we use a single sentence classifier
         if isinstance(task, WiCTask):
             d_out *= 3  # also pass the two contextual word representations
+        log.info(f'Task {task.name} has a classifier with d_out {d_out}')
         classifier = Classifier.from_params(d_out, n_classes, params)
         module = SingleClassifier(pooler, classifier)
     else:
@@ -724,11 +750,57 @@ class MultiTaskModel(nn.Module):
         """ Args: sentence encoder """
         super(MultiTaskModel, self).__init__()
         self.sent_encoder = sent_encoder
+
         self.vocab = vocab
         self.utilization = Average() if args.track_batch_utilization else None
         self.elmo = args.input_module == "elmo"
         self.use_bert = bool(args.input_module.startswith("bert"))
         self.sep_embs_for_skip = args.sep_embs_for_skip
+
+        #XXX: Dylan's code!
+        if args.special_task:
+            h_bert = sent_encoder.d_emb # might be sent_encoder.output_dim instead?
+        self.k_sem = args.k_sem
+        self.k_syn = args.k_syn
+        self.k_shared = args.k_shared
+        self.sem_proj = nn.Linear(h_bert, args.k_sem, bias=False) if args.special_task else lambda x : x
+        self.syn_proj = nn.Linear(h_bert, args.k_syn, bias=False) if args.special_task else lambda x : x
+        self.shared_proj = nn.Linear(h_bert, args.k_shared, bias=False) if args.special_task else None
+
+        self.spare_pooler = Pooler(
+                project=False,
+                d_inp=args.k_shared, 
+                d_proj=0,
+                pool_type="first",
+                )
+        def ortho_output(private,shared,mask):
+            private = self.spare_pooler(private, mask)
+            shared = self.spare_pooler(shared, mask)
+            return torch.mm(private, shared.permute(1,0))
+        self.ortho = ortho_output
+        
+        if args.special_task:
+            num_tasks = 2
+            pooler = Pooler(
+                project=False,
+                d_inp=args.k_shared, 
+                d_proj=0,
+                pool_type="first",
+            )
+            if args.discriminator_hidden > 0:
+                classifier = nn.Sequential(
+                        nn.Linear(args.k_shared, args.discriminator_hidden),
+                        nn.Tanh(),
+                        nn.LayerNorm(args.discriminator_hidden),
+                        nn.Dropout(0.2),
+                        nn.Linear(args.discriminator_hidden, num_tasks, bias=True)
+                        )
+            else:
+                classifier = nn.Linear(args.k_shared, num_tasks, bias=True)
+            self.adv_discriminator = SingleClassifier(pooler, classifier)
+        else:
+            self.adv_discriminator = None
+
 
     def forward(self, task, batch, predict=False):
         """
@@ -747,11 +819,11 @@ class MultiTaskModel(nn.Module):
                 self.utilization(get_batch_utilization(batch["input1"]))
             elif "input" in batch:
                 self.utilization(get_batch_utilization(batch["input"]))
-        if isinstance(task, SingleClassificationTask):
+        if isinstance(task, SingleClassificationTask): #XXX CoLA is a SingleClassificationTask
             out = self._single_sentence_forward(batch, task, predict)
         elif isinstance(task, GLUEDiagnosticTask):
             out = self._nli_diagnostic_forward(batch, task, predict)
-        elif isinstance(
+        elif isinstance( #XXX RTE is type PairClassificationTask
             task, (PairClassificationTask, PairRegressionTask, PairOrdinalRegressionTask)
         ):
             out = self._pair_sentence_forward(batch, task, predict)
@@ -799,9 +871,34 @@ class MultiTaskModel(nn.Module):
 
         # embed the sentence
         word_embs_in_context, sent_mask = self.sent_encoder(batch["input1"], task)
+
+        #XXX Dylan's code
+        if self.shared_proj != None:
+            if task.subspace == 'sem':
+                sem_in_context = self.sem_proj(word_embs_in_context)
+                if not 'adv' in task.name:
+                    shared_in_context = self.shared_proj(word_embs_in_context)
+                    word_embs_in_context = torch.cat([sem_in_context, shared_in_context], dim=-1)
+                    shared_private = self.ortho(sem_in_context, shared_in_context, sent_mask)
+                else:
+                    word_embs_in_context = sem_in_context
+            elif task.subspace == 'syn':
+                syn_in_context = self.syn_proj(word_embs_in_context) # Since CoLA is primarily syntactic
+                if not 'adv' in task.name:
+                    shared_in_context = self.shared_proj(word_embs_in_context)
+                    word_embs_in_context = torch.cat([syn_in_context, shared_in_context], dim=-1)
+                    shared_private = self.ortho(syn_in_context, shared_in_context, sent_mask)
+                else:
+                    word_embs_in_context = syn_in_context
+        #XXX
+
         # pass to a task specific classifier
         classifier = self._get_classifier(task)
         logits = classifier(word_embs_in_context, sent_mask)
+        #XXX
+        if not 'adv' in task.name and self.adv_discriminator != None:
+            logits_shared = self.adv_discriminator(shared_in_context, sent_mask)
+        #XXX
         out["logits"] = logits
         out["n_exs"] = get_batch_size(batch)
 
@@ -812,9 +909,18 @@ class MultiTaskModel(nn.Module):
                 labels = batch["labels"]
             else:
                 labels = batch["labels"].squeeze(-1)
+            #XXX
+            if not 'adv' in task.name and self.adv_discriminator != None:
+                task_id_labels = torch.zeros(labels.shape).to(labels.device).long()
+                out["loss_shared"] = F.cross_entropy(logits_shared, task_id_labels)
+                out["loss_orthogonality"] = shared_private.pow(2).sum()
             out["loss"] = F.cross_entropy(logits, labels)
             tagmask = batch.get("tagmask", None)
-            task.update_metrics(logits, labels, tagmask=tagmask)
+            if not 'discriminator' in task.name:
+                task.update_metrics(logits, labels, tagmask=tagmask)
+            else:
+                task.update_metrics(logits_shared, task_id_labels, tagmask=tagmask)
+            #XXX
 
         if predict:
             if isinstance(task, RegressionTask):
@@ -873,11 +979,37 @@ class MultiTaskModel(nn.Module):
         classifier = self._get_classifier(task)
         if self.use_bert:
             sent, mask = self.sent_encoder(batch["inputs"], task)
+
+            #XXX Dylan's code
+            if self.shared_proj != None:
+                if task.subspace == 'sem':
+                    sem_in_context = self.sem_proj(sent)
+                    if not 'adv' in task.name:
+                        shared_in_context = self.shared_proj(sent)
+                        sent = torch.cat([sem_in_context, shared_in_context], dim=-1)
+                        shared_private = self.ortho(sem_in_context, shared_in_context, mask)
+                    else:
+                        sent = sem_in_context
+                elif task.subspace == 'syn':
+                    syn_in_context = self.syn_proj(sent) # Since CoLA is primarily syntactic
+                    if not 'adv' in task.name:
+                        shared_in_context = self.shared_proj(sent)
+                        sent = torch.cat([syn_in_context, shared_in_context], dim=-1)
+                        shared_private = self.ortho(syn_in_context, shared_in_context, mask)
+                    else:
+                        sent = syn_in_context
+            #XXX
+
             # special case for WiC b/c we want to add representations of particular tokens
             if isinstance(task, WiCTask):
                 logits = classifier(sent, mask, [batch["idx1"], batch["idx2"]])
             else:
                 logits = classifier(sent, mask)
+                #XXX
+                if not 'adv' in task.name and self.adv_discriminator != None:
+                    logits_shared = self.adv_discriminator(shared_in_context, mask)
+                #XXX
+
         else:
             sent1, mask1 = self.sent_encoder(batch["input1"], task)
             sent2, mask2 = self.sent_encoder(batch["input2"], task)
@@ -898,8 +1030,17 @@ class MultiTaskModel(nn.Module):
                 labels_np = labels.data.cpu().numpy()
                 task.update_metrics(logits_np, labels_np, tagmask=tagmask)
             else:
+                #XXX
+                if not 'adv' in task.name and self.adv_discriminator != None:
+                    task_id_labels = torch.ones(labels.shape).to(labels.device).long()
+                    out["loss_shared"] = F.cross_entropy(logits_shared, task_id_labels)
+                    out["loss_orthogonality"] = shared_private.pow(2).sum()
+                #XXX
                 out["loss"] = F.cross_entropy(logits, labels)
-                task.update_metrics(logits, labels, tagmask=tagmask)
+                if not 'discriminator' in task.name:
+                    task.update_metrics(logits, labels, tagmask=tagmask)
+                else:
+                    task.update_metrics(logits_shared, task_id_labels, tagmask=tagmask)
 
         if predict:
             if isinstance(task, RegressionTask):

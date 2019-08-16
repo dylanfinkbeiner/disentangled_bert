@@ -359,16 +359,21 @@ def build_tasks(args):
         # only on training datasets at pretraining time.
         if task.name in pretrain_task_names:
             log.info("\tCreating trimmed pretraining-only version of " + task.name + " train.")
+            task.pretrain_fraction = float(args.get(f"pretrain_{(task.name).replace('-', '_')}_fraction", 1.0)) 
+            #task.pretrain_fraction = args.pretrain_data_fraction # Original
+            log.info(f"Task {task.name} instance generator using {task.pretrain_fraction * 100}% of training data.")
             task.train_data = _get_instance_generator(
-                task.name, "train", preproc_dir, fraction=args.pretrain_data_fraction
+                task.name, "train", preproc_dir, fraction=task.pretrain_fraction
             )
             pretrain_tasks.append(task)
         # When using target_train_data_fraction, we need modified iterators
         # only for training datasets at do_target_task_training time.
         if task.name in target_task_names:
             log.info("\tCreating trimmed target-only version of " + task.name + " train.")
+            task.target_train_fraction = float(args.get(f"target_train_{(task.name).replace('-', '_')}_fraction", 1.0)) 
+            #task.target_train_fraction = args.target_train_data_fraction # Original
             task.train_data = _get_instance_generator(
-                task.name, "train", preproc_dir, fraction=args.target_train_data_fraction
+                task.name, "train", preproc_dir, fraction=task.target_train_fraction
             )
             target_tasks.append(task)
 

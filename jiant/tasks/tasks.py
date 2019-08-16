@@ -54,6 +54,14 @@ UNK_TOK_ALLENNLP = "@@UNKNOWN@@"
 UNK_TOK_ATOMIC = "UNKNOWN"  # an unk token that won't get split by tokenizers
 
 
+#class SyntacticTask():
+#    def __init__(self):
+#        pass
+#
+#class SemanticTask():
+#    def __init__(self):
+#        pass
+
 def sentence_to_text_field(sent: Sequence[str], indexers: Any):
     """ Helper function to map a sequence of tokens into a sequence of
     AllenNLP Tokens, then wrap in a TextField with the given indexers """
@@ -194,8 +202,11 @@ class Task(object):
         - optimizer
     """
 
-    def __init__(self, name, tokenizer_name):
+    def __init__(self, name, tokenizer_name, subspace=None):
         self.name = name
+        #XXX
+        self.subspace = subspace
+        #XXX
         self._tokenizer_name = tokenizer_name
         self.scorers = []
         self.eval_only_task = False
@@ -563,7 +574,9 @@ class CoLANPITask(SingleClassificationTask):
         return
 
 
-@register_task("cola", rel_path="CoLA/")
+@register_task("cola", rel_path="CoLA/", subspace="syn")
+@register_task("cola-adv", rel_path="CoLA/", subspace="sem")
+@register_task("cola-discriminator", rel_path="CoLA/", subspace="syn")
 class CoLATask(SingleClassificationTask):
     """Class for Warstdadt acceptability task"""
 
@@ -1094,7 +1107,9 @@ class SNLITask(PairClassificationTask):
         log.info("\tFinished loading SNLI data.")
 
 
-@register_task("mnli", rel_path="MNLI/")
+@register_task("mnli", rel_path="MNLI/", subspace="sem")
+@register_task("mnli-adv", rel_path="MNLI/", subspace="syn")
+@register_task("mnli-discriminator", rel_path="MNLI/", subspace="sem")
 # second copy for different params
 @register_task("mnli-alt", rel_path="MNLI/")
 class MultiNLITask(PairClassificationTask):
@@ -1597,7 +1612,8 @@ class WinogenderTask(GLUEDiagnosticTask):
         self.gender_parity_scorer(batch_dict)
 
 
-@register_task("rte", rel_path="RTE/")
+@register_task("rte", rel_path="RTE/", subspace="sem")
+@register_task("rte-adv", rel_path="RTE/", subspace="syn")
 class RTETask(PairClassificationTask):
     """ Task class for Recognizing Textual Entailment 1, 2, 3, 5 """
 
@@ -1650,10 +1666,25 @@ class RTETask(PairClassificationTask):
             + self.val_data_text[0]
             + self.val_data_text[1]
         )
+
+        max_yet = 0
+        for s1, s2 in zip(self.train_data_text[0], self.train_data_text[1]):
+            x = len(s1) + len(s2)
+            if x > max_yet:
+                max_yet = x
+        log.info(f'Longest in training set is {max_yet}')
+        max_yet = 0
+        for s1, s2 in zip(self.val_data_text[0], self.val_data_text[1]):
+            x = len(s1) + len(s2)
+            if x > max_yet:
+                max_yet = x
+        log.info(f'Longest in validation set is {max_yet}')
+
         log.info("\tFinished loading RTE (from GLUE formatted data).")
 
 
-@register_task("rte-superglue", rel_path="RTE/")
+@register_task("rte-superglue", rel_path="RTE/", subspace="sem")
+@register_task("rte-superglue-adv", rel_path="RTE/", subspace="syn")
 class RTESuperGLUETask(RTETask):
     """ Task class for Recognizing Textual Entailment 1, 2, 3, 5
     Uses JSONL format used by SuperGLUE"""

@@ -13,6 +13,7 @@ import glob
 import numpy as np
 import torch
 import jsondiff
+import pickle
 
 from allennlp.common.checks import ConfigurationError
 from allennlp.common.params import Params
@@ -558,3 +559,14 @@ class MaskedMultiHeadSelfAttention(Seq2SeqEncoder):
 
 def assert_for_log(condition, error_message):
     assert condition, error_message
+
+
+def get_records_dict(path):
+    with open(path, 'rb') as f:
+        records_dict = pickle.load(f)
+    return records_dict
+
+
+def write_records_dict(records_dict, path):
+    with open(path, 'wb') as f:
+        pickle.dump(records_dict, f)

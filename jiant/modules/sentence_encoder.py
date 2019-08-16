@@ -50,6 +50,7 @@ class SentenceEncoder(Model):
             d_emb = text_field_embedder.get_output_dim()
             self._highway_layer = TimeDistributed(Highway(d_emb, num_highway_layers))
 
+        self.d_emb = d_emb
         self._phrase_layer = phrase_layer
         self._cove_layer = cove_layer
         self.pad_idx = vocab.get_token_index(vocab._padding_token)
